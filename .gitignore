@@ -1,0 +1,4 @@
+# Ignore large dataset folders
+Clean Data/
+Dataset/
+Charts/
