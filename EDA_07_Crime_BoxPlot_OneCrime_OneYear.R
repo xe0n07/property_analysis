@@ -1,17 +1,29 @@
+# =============================================================================
+# EDA_07_Crime_BoxPlot_OneCrime_OneYear.R
+# Box plot of one chosen crime type, one chosen year (2024 or 2025),
+# Norfolk vs Suffolk
+#
+# NOTE: this script's underlying logic was already correct in your original
+# version (monthly counts aggregated by county, one dot per month, boxed by
+# county) - it is reproduced here mostly unchanged, with clearer comments
+# and consistent styling with the rest of the EDA set.
+# =============================================================================
+
 library(DBI)
 library(RSQLite)
 library(dplyr)
 library(ggplot2)
 
-db_path = "D:/Data_Science/Clean Data/norfolk_suffolk.db"
-chart_path = "D:/Data_Science/Charts/07_Crime_BoxPlot_ViolenceAndSexualOffences_2024.png"
+db_path    <- "D:/Data_Science/Clean Data/norfolk_suffolk.db"
+chart_path <- "D:/Data_Science/Charts/07_Crime_BoxPlot_OneCrime_OneYear.png"
 
-con = dbConnect(SQLite(), db_path)
+# ---- Choose crime type and year here ---------------------------------------
+chosen_crime <- "Violence And Sexual Offences"   # change to any crime_type value in fact_crime
+chosen_year  <- 2024                             # must be 2024 or 2025 per brief
 
-chosen_crime = "Violence And Sexual Offences"
-chosen_year = 2024
+con <- dbConnect(SQLite(), db_path)
 
-crime_monthly = dbGetQuery(con, sprintf("
+crime_monthly <- dbGetQuery(con, sprintf("
   SELECT
     strftime('%%Y-%%m', c.crime_date) AS year_month,
     l.county_id,
@@ -30,10 +42,26 @@ dbDisconnect(con)
 cat("\n============================\n")
 cat("CRIME TYPE :", chosen_crime, "| YEAR :", chosen_year, "\n")
 cat("============================\n")
-cat("\nMonthly crime-count rows retrieved : ", nrow(crime_monthly))
+cat("\nMonthly crime-count rows retrieved :", nrow(crime_monthly), "\n")
 print(crime_monthly)
 
-box_plot = ggplot(crime_monthly, aes(x = county_name, y = crime_count, fill = county_name)) +
+# ---- Summary statistics for the report -------------------------------------
+crime_stats <- crime_monthly %>%
+  group_by(county_name) %>%
+  summarise(
+    mean_count   = mean(crime_count, na.rm = TRUE),
+    median_count = median(crime_count, na.rm = TRUE),
+    sd_count     = sd(crime_count, na.rm = TRUE),
+    n_months     = n(),
+    .groups = "drop"
+  )
+
+cat("\n============================\n")
+cat(chosen_crime, "-", chosen_year, "MONTHLY COUNT STATISTICS\n")
+cat("============================\n")
+print(crime_stats)
+
+box_plot <- ggplot(crime_monthly, aes(x = county_name, y = crime_count, fill = county_name)) +
   geom_boxplot(width = 0.5, outlier.alpha = 0.5) +
   geom_jitter(width = 0.08, alpha = 0.5, size = 2) +
   scale_fill_manual(values = c("Norfolk" = "#2E86AB", "Suffolk" = "#E67E22")) +
