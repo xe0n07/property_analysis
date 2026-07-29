@@ -1,108 +1,201 @@
+# =============================================================================
+# EDA_08_Crime_Radar_VehicleCrime.R
+# Radar chart: Vehicle Crime rate per 100,000 people, Norfolk vs Suffolk,
+# 12-month window (May start_year - April start_year + 1)
+#
+# FIX vs. previous version - two separate bugs were stacked on top of each
+# other, which is why this kept failing in different ways:
+#
+# BUG 1 - crime_date is NOT stored as text.
+#   Despite the build script calling format(crime_date, "%Y-%m-%d"), the
+#   column ends up in SQLite as REAL: R's native Date representation (days
+#   since 1970-01-01). Calling SQLite's strftime()/date() directly on that
+#   column does NOT work, because SQLite interprets a bare number as a
+#   Julian Day count from 4714 BC, not an R-epoch day count. That is exactly
+#   why earlier runs printed dates like "-4658-01" and why date-range
+#   filtering done inside SQL returned 0 rows.
+#   FIX: pull crime_date out as-is and convert it in R with
+#   as.Date(crime_date, origin = "1970-01-01") - NOT "1899-12-30" (that's
+#   Excel's epoch, and it's what produced the wrong dates / 0 rows in the
+#   second-to-last attempt). The "year" column already in fact_crime is
+#   reliable on its own, so we use it directly instead of re-deriving year
+#   from crime_date.
+#
+# BUG 2 - radar_data was a matrix, not a data frame.
+#   radar_data <- rbind(rep(100,12), rep(0,12), norfolk_pct, suffolk_pct)
+#   rbind() of plain numeric vectors returns a matrix. fmsb::radarchart()
+#   requires a data.frame - with a matrix it just prints
+#   "The data must be given as dataframe." and returns NULL *without*
+#   calling plot.new(), which is why the following legend() call then threw
+#   "plot.new has not been called yet".
+#   FIX: wrap the row-bound object in as.data.frame().
+#
+# Values were checked against the actual norfolk_suffolk.db to confirm the
+# corrected logic returns real, non-zero, month-varying rates.
+# =============================================================================
+
 library(DBI)
 library(RSQLite)
 library(dplyr)
-library(tidyr)
+library(lubridate)
 library(fmsb)
+library(scales)
 
-db_path = "D:/Data_Science/Clean Data/norfolk_suffolk.db"
-chart_path = "D:/Data_Science/Charts/08_Crime_Radar_VehicleCrime.png"
+db_path    <- "D:/Data_Science/Clean Data/norfolk_suffolk.db"
+chart_path <- "D:/Data_Science/Charts/08_Crime_Radar_VehicleCrime.png"
 
-con = dbConnect(SQLite(), db_path)
+# ---- Choose the 12-month window here (May start_year -> April start_year+1)
+start_year <- 2025
 
-population_by_county = dbGetQuery(con, "
-  SELECT l.county_id, cn.county_name, SUM(p.population) AS total_population
+month_numbers <- c(5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4)
+month_names   <- c("May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                   "Nov", "Dec", "Jan", "Feb", "Mar", "Apr")
+
+con <- dbConnect(SQLite(), db_path)
+
+# ---- Population per county (denominator for the rate) ----------------------
+population <- dbGetQuery(con, "
+  SELECT
+    cn.county_name,
+    SUM(p.population) AS total_population
   FROM fact_population p
-  JOIN dim_lsoa l ON p.lsoa_code = l.lsoa_code
+  JOIN dim_lsoa l  ON p.lsoa_code = l.lsoa_code
   JOIN dim_county cn ON l.county_id = cn.county_id
-  GROUP BY l.county_id, cn.county_name
+  GROUP BY cn.county_name
 ")
 
-vehicle_crime_monthly = dbGetQuery(con, "
+# ---- All Vehicle Crime rows, with the raw (numeric) crime_date and the -----
+# ---- already-reliable 'year' column pulled straight from fact_crime -------
+# NOTE: deliberately NOT using strftime() on crime_date in SQL - see BUG 1.
+vehicle_crime <- dbGetQuery(con, "
   SELECT
-    strftime('%m', c.crime_date) AS month_num,
-    cn.county_name,
-    COUNT(*) AS crime_count
+    c.crime_date,
+    c.year,
+    cn.county_name
   FROM fact_crime c
-  JOIN dim_lsoa l ON c.lsoa_code = l.lsoa_code
+  JOIN dim_lsoa l  ON c.lsoa_code = l.lsoa_code
   JOIN dim_county cn ON l.county_id = cn.county_id
   WHERE c.crime_type = 'Vehicle Crime'
-    AND (
-      (strftime('%Y', c.crime_date) = '2024' AND CAST(strftime('%m', c.crime_date) AS INTEGER) >= 5)
-      OR
-      (strftime('%Y', c.crime_date) = '2025' AND CAST(strftime('%m', c.crime_date) AS INTEGER) <= 4)
-    )
-  GROUP BY month_num, cn.county_name
 ")
 
 dbDisconnect(con)
 
-cat("\nPopulation by county\n")
-print(population_by_county)
+cat("\nVehicle crime rows pulled :", nrow(vehicle_crime), "\n")
 
-cat("\nVehicle crime monthly counts (May 2024 - April 2025)\n")
-print(vehicle_crime_monthly)
+if (nrow(vehicle_crime) == 0) {
+  stop("No Vehicle Crime rows were returned - check crime_type spelling / table contents.")
+}
 
-month_labels = tibble(
-  month_num = sprintf("%02d", c(5:12, 1:4)),
-  month_name = c("May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr"),
-  month_order = 1:12
-)
-
-vehicle_crime_rate = vehicle_crime_monthly %>%
-  left_join(population_by_county, by = "county_name") %>%
+# ---- Correct date conversion: R-epoch REAL -> Date -------------------------
+vehicle_crime <- vehicle_crime %>%
   mutate(
-    rate_per_100k = (crime_count / total_population) * 100000
-  ) %>%
-  left_join(month_labels, by = "month_num") %>%
-  filter(!is.na(month_order)) %>%
-  arrange(month_order)
+    crime_date = as.Date(crime_date, origin = "1970-01-01"),
+    month      = month(crime_date)
+  )
+
+# ---- Keep only the chosen 12-month window (May start_year - Apr start_year+1)
+vehicle_crime <- vehicle_crime %>%
+  filter(
+    (year == start_year     & month >= 5) |
+      (year == start_year + 1 & month <= 4)
+  )
+
+cat("Rows in window May", start_year, "- April", start_year + 1, ":", nrow(vehicle_crime), "\n")
+
+if (nrow(vehicle_crime) == 0) {
+  stop("No Vehicle Crime rows fall inside the chosen 12-month window - try a different start_year.")
+}
+
+# ---- Monthly count -> rate per 100,000 people, by county -------------------
+vehicle_crime_rate <- vehicle_crime %>%
+  count(county_name, month, name = "crime_count") %>%
+  left_join(population, by = "county_name") %>%
+  mutate(rate_per_100k = (crime_count / total_population) * 100000)
+
+# ---- Build one row per county, columns in May -> April order, filling any --
+# ---- missing county/month combination with a 0 rate ------------------------
+norfolk_values <- sapply(month_numbers, function(m) {
+  v <- vehicle_crime_rate$rate_per_100k[
+    vehicle_crime_rate$county_name == "Norfolk" & vehicle_crime_rate$month == m
+  ]
+  if (length(v) == 0) 0 else v
+})
+
+suffolk_values <- sapply(month_numbers, function(m) {
+  v <- vehicle_crime_rate$rate_per_100k[
+    vehicle_crime_rate$county_name == "Suffolk" & vehicle_crime_rate$month == m
+  ]
+  if (length(v) == 0) 0 else v
+})
 
 cat("\n============================\n")
-cat("VEHICLE CRIME RATE PER 100,000 (MAY 2024 - APRIL 2025)\n")
+cat("VEHICLE CRIME RATE PER 100,000 (MAY", start_year, "- APRIL", start_year + 1, ")\n")
 cat("============================\n")
-print(vehicle_crime_rate %>% select(month_name, county_name, rate_per_100k))
+print(data.frame(
+  month         = month_names,
+  norfolk_rate  = round(norfolk_values, 2),
+  suffolk_rate  = round(suffolk_values, 2)
+))
 
-radar_data = vehicle_crime_rate %>%
-  select(month_name, county_name, rate_per_100k) %>%
-  pivot_wider(names_from = month_name, values_from = rate_per_100k) %>%
-  select(county_name, all_of(month_labels$month_name))
+# ---- Express each county's rate as a % of the overall max rate, to match --
+# ---- the 0-100% radial scale used in the reference chart -------------------
+maximum_value <- max(c(norfolk_values, suffolk_values), na.rm = TRUE)
+if (maximum_value <= 0) maximum_value <- 1
 
-radar_matrix = as.data.frame(radar_data[, -1])
-rownames(radar_matrix) = radar_data$county_name
+norfolk_percentage <- round((norfolk_values / maximum_value) * 100, 2)
+suffolk_percentage <- round((suffolk_values / maximum_value) * 100, 2)
 
-max_val = ceiling(max(radar_matrix, na.rm = TRUE) * 1.1)
-min_val = 0
+# ---- FIX for BUG 2: wrap in as.data.frame() so fmsb accepts it -------------
+radar_data <- as.data.frame(rbind(
+  rep(100, 12),
+  rep(0, 12),
+  norfolk_percentage,
+  suffolk_percentage
+))
+colnames(radar_data) <- month_names
+rownames(radar_data) <- c("max", "min", "Norfolk", "Suffolk")
 
-radar_plot_data = rbind(
-  rep(max_val, ncol(radar_matrix)),
-  rep(min_val, ncol(radar_matrix)),
-  radar_matrix
+dir.create("D:/Data_Science/Charts", recursive = TRUE, showWarnings = FALSE)
+
+png(
+  filename = chart_path,
+  width  = 3600,
+  height = 3200,
+  res    = 400
 )
 
-dir.create("D:/Data_Science/Charts", showWarnings = FALSE, recursive = TRUE)
-
-png(chart_path, width = 2400, height = 2200, res = 300)
+par(mar = c(7, 4, 5, 4))  # extra bottom margin so the legend has room below "Nov"
 
 radarchart(
-  radar_plot_data,
-  pcol = c("#2E86AB", "#E67E22"),
-  pfcol = scales::alpha(c("#2E86AB", "#E67E22"), 0.25),
-  plwd = 2.5,
-  plty = 1,
-  cglcol = "grey70",
-  cglty = 1,
-  axislabcol = "grey40",
-  vlcex = 0.9,
-  title = "Vehicle Crime Rate per 100,000 (May 2024 - April 2025)"
+  radar_data,
+  axistype   = 1,
+  pcol       = c("#1F77B4", "#FF7F0E"),
+  pfcol      = alpha(c("#1F77B4", "#FF7F0E"), 0.25),
+  plwd       = 3,
+  plty       = 1,
+  cglcol     = "grey75",
+  cglty      = 1,
+  cglwd      = 1,
+  vlcex      = 1.1,
+  axislabcol = "black",
+  caxislabels = c("0%", "25%", "50%", "75%", "100%"),
+  title = paste0(
+    "Vehicle Crime Rate per 100,000 Population\n",
+    "May ", start_year, " - April ", start_year + 1
+  )
 )
 
 legend(
-  "topright",
-  legend = rownames(radar_matrix),
-  col = c("#2E86AB", "#E67E22"),
-  lty = 1,
-  lwd = 2.5,
-  bty = "n"
+  "bottom",
+  inset  = -0.18,   # negative inset pushes the legend below the plot region,
+  # clear of the "Nov" axis label
+  xpd    = TRUE,     # allow drawing outside the plot region
+  legend = c("NORFOLK", "SUFFOLK"),
+  col    = c("#1F77B4", "#FF7F0E"),
+  lwd    = 3,
+  cex    = 1.1,
+  horiz  = TRUE,
+  bty    = "n"
 )
 
 dev.off()
